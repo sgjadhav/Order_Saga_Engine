@@ -87,7 +87,7 @@ async def process_compensation_event(event_data: dict):
             print(f"⚠️ Compensation for Order #{order_id} already applied. Skipping.")
             return
 
-        query = select(InventoryItem).where(InventoryItem.item_name == item_name)
+        query = (select(InventoryItem).where(InventoryItem.item_name == item_name).with_for_update())
         result = await session.execute(query)
         item = result.scalar_one_or_none()
 
