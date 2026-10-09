@@ -23,12 +23,21 @@ async def update_order_status(event_data: dict):
         result = await session.execute(query)
         order = result.scalar_one_or_none()
 
-        if order:
+        if not order:
+            print(f"⚠️ Order #{order_id} not found in database.")
+            return
+
+        # Idempotency & Terminal State Guard:
+        # Agar order already terminal state me hai, duplicate event ignore karo
+        if order.status in ["CONFIRMED", "CANCELLED"]:
+            print(f"⚠️ [Idempotent Guard] Order #{order_id} already in terminal state [{order.status}]. Skipping duplicate event.")
+            return
+
+        # Only transition from PENDING to terminal states
+        if order.status == "PENDING":
             order.status = new_status
             await session.commit()
-            print(f"📦 Order #{order_id} status updated to -> [{new_status}]")
-        else:
-            print(f"⚠️ Order #{order_id} not found in database.")
+            print(f"📦 Order #{order_id} status updated from [PENDING] -> [{new_status}]")
 
 async def run_order_status_consumer():
     consumer = AIOKafkaConsumer(

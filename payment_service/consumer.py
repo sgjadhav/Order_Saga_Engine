@@ -2,6 +2,7 @@ import asyncio
 import json
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from payment_service.database import engine, Base, AsyncSessionLocal
 from payment_service.models import Payment, ProcessedPaymentEvent
 
@@ -29,49 +30,46 @@ async def process_payment_event(event_data: dict, producer: AIOKafkaProducer):
     event_unique_id = f"payment_order_{order_id}"
 
     async with AsyncSessionLocal() as session:
-        # Idempotency Check
-        dedup_check = await session.execute(
-            select(ProcessedPaymentEvent).where(ProcessedPaymentEvent.event_id == event_unique_id)
-        )
-        if dedup_check.scalar_one_or_none():
-            print(f"⚠️ Payment for Order #{order_id} already processed. Skipping.")
-            return
+        try:
+            async with session.begin():
+                # 1. ATOMIC DEDUPLICATION: Pehle insert karo
+                session.add(ProcessedPaymentEvent(event_id=event_unique_id))
+                await session.flush()
 
-        # Payment rule: > 8000 fail hoga simulation ke liye, <= 8000 success
-        if amount <= 10000.0:
-            payment_status = "SUCCESS"
-            new_payment = Payment(order_id=order_id, amount=amount, status=payment_status)
-            session.add(new_payment)
-            session.add(ProcessedPaymentEvent(event_id=event_unique_id))
-            await session.commit()
+                # 2. Payment evaluation & Record creation
+                if amount <= 10000.0:
+                    payment_status = "SUCCESS"
+                    out_event = {
+                        "event_type": "PaymentCompleted",
+                        "order_id": order_id,
+                        "amount": amount,
+                        "status": "PAID"
+                    }
+                else:
+                    payment_status = "FAILED"
+                    out_event = {
+                        "event_type": "PaymentFailed",
+                        "order_id": order_id,
+                        "item_name": item_name,
+                        "quantity": quantity,
+                        "reason": "PAYMENT_LIMIT_EXCEEDED"
+                    }
 
-            print(f"💳 Payment SUCCESS of ₹{amount} for Order #{order_id}!")
-            
-            out_event = {
-                "event_type": "PaymentCompleted",
-                "order_id": order_id,
-                "amount": amount,
-                "status": "PAID"
-            }
+                new_payment = Payment(order_id=order_id, amount=amount, status=payment_status)
+                session.add(new_payment)
+
+            # 3. Publish event only after successful DB commit
+            if payment_status == "SUCCESS":
+                print(f"💳 Payment SUCCESS of ₹{amount} for Order #{order_id}!")
+            else:
+                print(f"❌ Payment FAILED of ₹{amount} for Order #{order_id} (Limit exceeded)!")
+
             await producer.send_and_wait(PAYMENT_TOPIC, json.dumps(out_event).encode('utf-8'))
-        else:
-            payment_status = "FAILED"
-            new_payment = Payment(order_id=order_id, amount=amount, status=payment_status)
-            session.add(new_payment)
-            session.add(ProcessedPaymentEvent(event_id=event_unique_id))
-            await session.commit()
 
-            print(f"❌ Payment FAILED of ₹{amount} for Order #{order_id} (Limit exceeded)!")
-            
-            # Emit PaymentFailed to trigger Saga rollback in Inventory & Order service
-            out_event = {
-                "event_type": "PaymentFailed",
-                "order_id": order_id,
-                "item_name": item_name,
-                "quantity": quantity,
-                "reason": "PAYMENT_LIMIT_EXCEEDED"
-            }
-            await producer.send_and_wait(PAYMENT_TOPIC, json.dumps(out_event).encode('utf-8'))
+        except IntegrityError:
+            # Duplicate event caught atomically by Primary Key constraint
+            await session.rollback()
+            print(f"⚠️ [Idempotent Guard] Payment event '{event_unique_id}' already processed. Safely skipped.")
 
 async def run_payment_consumer():
     await init_db()
