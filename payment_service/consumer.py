@@ -1,14 +1,18 @@
 import asyncio
 import json
+import os
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from payment_service.database import engine, Base, AsyncSessionLocal
 from payment_service.models import Payment, ProcessedPaymentEvent
 
-KAFKA_BOOTSTRAP_SERVERS = "127.0.0.1:9092"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', '127.0.0.1:9092')
 INVENTORY_TOPIC = "inventory-events"
 PAYMENT_TOPIC = "payment-events"
+
+# Payment evaluation threshold configurable via environment (12-factor)
+PAYMENT_LIMIT_THRESHOLD = float(os.getenv('PAYMENT_LIMIT_THRESHOLD', '10000.0'))
 
 async def init_db():
     async with engine.begin() as conn:
@@ -25,8 +29,8 @@ async def process_payment_event(event_data: dict, producer: AIOKafkaProducer):
     quantity = event_data.get("quantity", 1)
     item_name = event_data.get("item_name")
     
-    # Calculate amount: har keyboard 4500 ka hai
-    amount = float(quantity) * 4500.0
+    # Calculate amount: dynamic pricing propagated through the saga (no hardcoding)
+    amount = float(event_data.get('total_amount', float(quantity) * float(event_data.get('price', 0.0))))
     event_unique_id = f"payment_order_{order_id}"
 
     async with AsyncSessionLocal() as session:
@@ -37,7 +41,7 @@ async def process_payment_event(event_data: dict, producer: AIOKafkaProducer):
                 await session.flush()
 
                 # 2. Payment evaluation & Record creation
-                if amount <= 10000.0:
+                if amount <= PAYMENT_LIMIT_THRESHOLD:
                     payment_status = "SUCCESS"
                     out_event = {
                         "event_type": "PaymentCompleted",
@@ -78,7 +82,8 @@ async def run_payment_consumer():
         INVENTORY_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         group_id="payment_service_group",
-        auto_offset_reset="earliest"
+        auto_offset_reset="earliest",
+        enable_auto_commit=False
     )
     producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
 
@@ -91,6 +96,9 @@ async def run_payment_consumer():
             event_payload = json.loads(msg.value.decode('utf-8'))
             print(f"📥 [Payment] Received event: {event_payload}")
             await process_payment_event(event_payload, producer)
+
+            # MANUAL COMMIT: acknowledge the offset only after processing succeeded
+            await consumer.commit()
     except Exception as e:
         print(f"❌ Error in payment consumer: {e}")
     finally:

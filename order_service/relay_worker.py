@@ -1,11 +1,12 @@
 import asyncio
 import json
+import os
 from aiokafka import AIOKafkaProducer
 from sqlalchemy import select
 from order_service.database import AsyncSessionLocal
 from order_service.models import OutboxMessage
 
-KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', '127.0.0.1:9092')
 KAFKA_TOPIC = "order-events"
 
 async def run_relay_worker():
@@ -31,10 +32,12 @@ async def run_relay_worker():
 
                     # 4. Outbox table mein status update karo
                     msg.processed = "PROCESSED"
-                
-                # 5. DB changes commit karo
-                if pending_messages:
+
+                    # 5. Per-message commit: failure on message N must not cause
+                    # messages 1..N-1 to be re-sent on restart
                     await session.commit()
+
+                if pending_messages:
                     print(f"✅ Successfully processed {len(pending_messages)} event(s).")
 
             # 6. Har 2 second mein poll karo

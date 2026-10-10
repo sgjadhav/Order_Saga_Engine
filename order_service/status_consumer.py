@@ -1,11 +1,12 @@
 import asyncio
 import json
+import os
 from aiokafka import AIOKafkaConsumer
 from sqlalchemy import update, select
 from order_service.database import AsyncSessionLocal
 from order_service.models import Order
 
-KAFKA_BOOTSTRAP_SERVERS = "127.0.0.1:9092"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', '127.0.0.1:9092')
 PAYMENT_TOPIC = "payment-events"
 
 async def update_order_status(event_data: dict):
@@ -44,7 +45,8 @@ async def run_order_status_consumer():
         PAYMENT_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         group_id="order_status_update_group",
-        auto_offset_reset="earliest"
+        auto_offset_reset="earliest",
+        enable_auto_commit=False
     )
 
     await consumer.start()
@@ -55,6 +57,9 @@ async def run_order_status_consumer():
             event_payload = json.loads(msg.value.decode("utf-8"))
             print(f"📥 [Order Update] Received event: {event_payload}")
             await update_order_status(event_payload)
+
+            # MANUAL COMMIT: acknowledge the offset only after status update completed
+            await consumer.commit()
     except Exception as e:
         print(f"❌ Error in order status consumer: {e}")
     finally:

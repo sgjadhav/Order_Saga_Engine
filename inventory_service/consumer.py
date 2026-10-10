@@ -1,15 +1,21 @@
 import asyncio
 import json
+import os
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from inventory_service.database import engine, Base, AsyncSessionLocal
 from inventory_service.models import InventoryItem, ProcessedEvent
 
-KAFKA_BOOTSTRAP_SERVERS = "127.0.0.1:9092"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', '127.0.0.1:9092')
 ORDER_TOPIC = "order-events"
 INVENTORY_TOPIC = "inventory-events"
 PAYMENT_TOPIC = "payment-events"
+
+# Seed defaults configurable via environment (12-factor)
+SEED_ITEM_NAME = os.getenv('SEED_ITEM_NAME', 'Mechanical Keyboard')
+SEED_ITEM_STOCK = int(os.getenv('SEED_ITEM_STOCK', '10'))
+SEED_ITEM_PRICE = float(os.getenv('SEED_ITEM_PRICE', '4500.0'))
 
 async def init_db_and_seed_data():
     async with engine.begin() as conn:
@@ -17,23 +23,28 @@ async def init_db_and_seed_data():
     
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(InventoryItem).where(InventoryItem.item_name == "Mechanical Keyboard")
+            select(InventoryItem).where(InventoryItem.item_name == SEED_ITEM_NAME)
         )
         item = result.scalar_one_or_none()
         if not item:
             sample_item = InventoryItem(
-                item_name="Mechanical Keyboard",
-                available_stock=10,
-                price=4500.0
+                item_name=SEED_ITEM_NAME,
+                available_stock=SEED_ITEM_STOCK,
+                price=SEED_ITEM_PRICE
             )
             session.add(sample_item)
             await session.commit()
-            print("📦 Initial stock seeded: Mechanical Keyboard (Stock: 10)")
+            print(f"📦 Initial stock seeded: {SEED_ITEM_NAME} (Stock: {SEED_ITEM_STOCK})")
 
 async def process_order_event(event_data: dict, producer: AIOKafkaProducer):
     order_id = event_data.get("order_id")
     item_name = event_data.get("item_name")
     quantity = event_data.get("quantity", 1)
+    # Dynamic pricing propagated from the order service (no hardcoded prices)
+    price = event_data.get("price")
+    total_amount = event_data.get("total_amount")
+    if total_amount is None and price is not None:
+        total_amount = float(price) * quantity
     event_unique_id = f"order_{order_id}_created"
 
     async with AsyncSessionLocal() as session:
@@ -60,15 +71,16 @@ async def process_order_event(event_data: dict, producer: AIOKafkaProducer):
                 item.available_stock -= quantity
                 # Both ProcessedEvent and Inventory update commit atomically at block exit
                 print(f"✅ Stock Reserved for Order #{order_id}! Remaining Stock: {item.available_stock}")
-                
+
                 out_event = {
                     "event_type": "InventoryReserved",
                     "order_id": order_id,
                     "item_name": item_name,
                     "quantity": quantity,
+                    "price": price,
+                    "total_amount": total_amount,
                     "status": "STOCK_RESERVED"
                 }
-                await producer.send_and_wait(INVENTORY_TOPIC, json.dumps(out_event).encode('utf-8'))
             else:
                 print(f"❌ Insufficient Stock for Order #{order_id} ({item_name})!")
                 out_event = {
@@ -76,7 +88,10 @@ async def process_order_event(event_data: dict, producer: AIOKafkaProducer):
                     "order_id": order_id,
                     "reason": "OUT_OF_STOCK"
                 }
-                await producer.send_and_wait(INVENTORY_TOPIC, json.dumps(out_event).encode('utf-8'))
+
+        # DUAL-WRITE DECOUPLING: DB transaction commits first (block exit above),
+        # only then publish the resulting event to Kafka.
+        await producer.send_and_wait(INVENTORY_TOPIC, json.dumps(out_event).encode('utf-8'))
 
 async def process_compensation_event(event_data: dict):
     event_type = event_data.get("event_type")
@@ -119,7 +134,8 @@ async def run_inventory_consumer():
         PAYMENT_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         group_id="inventory_service_group",
-        auto_offset_reset="earliest"
+        auto_offset_reset="earliest",
+        enable_auto_commit=False
     )
     producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
 
@@ -134,6 +150,9 @@ async def run_inventory_consumer():
                 await process_order_event(event_payload, producer)
             elif msg.topic == PAYMENT_TOPIC:
                 await process_compensation_event(event_payload)
+
+            # MANUAL COMMIT: acknowledge the offset only after processing completed
+            await consumer.commit()
     except Exception as e:
         print(f"❌ Error in inventory consumer: {e}")
     finally:

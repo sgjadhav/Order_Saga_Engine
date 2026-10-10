@@ -50,6 +50,7 @@ async def create_order(
         "item_name": new_order.item_name,
         "quantity": new_order.quantity,
         "price": new_order.price,
+        "total_amount": new_order.price * new_order.quantity,
         "status": new_order.status
     }
     outbox_entry = OutboxMessage(
