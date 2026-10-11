@@ -1,10 +1,9 @@
 import asyncio
 import pytest
-from unittest.mock import AsyncMock
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from inventory_service.database import engine
-from inventory_service.models import Base, InventoryItem, ProcessedEvent
+from inventory_service.models import Base, InventoryItem, ProcessedEvent, OutboxMessage
 from inventory_service.consumer import process_order_event
 
 @pytest.mark.asyncio
@@ -21,10 +20,6 @@ async def test_atomic_idempotency_duplicate_messages():
         session.add(item)
         await session.commit()
 
-    # Mock producer to avoid real Redpanda broker calls during unit test
-    mock_producer = AsyncMock()
-    mock_producer.send_and_wait = AsyncMock()
-
     # Simulating Kafka redelivering the exact same event 5 times at the exact same moment
     duplicate_payload = {
         "order_id": 999,
@@ -33,7 +28,7 @@ async def test_atomic_idempotency_duplicate_messages():
     }
 
     # 2. Fire 5 duplicate events concurrently
-    tasks = [process_order_event(duplicate_payload, mock_producer) for _ in range(5)]
+    tasks = [process_order_event(duplicate_payload) for _ in range(5)]
     await asyncio.gather(*tasks)
 
     # 3. Assertions
@@ -50,6 +45,14 @@ async def test_atomic_idempotency_duplicate_messages():
         events = res_events.scalars().all()
         assert len(events) == 1, f"Expected 1 processed_event record, found {len(events)}"
         assert events[0].event_id == "order_999_created"
+
+        # TRANSACTIONAL OUTBOX: exactly one PENDING outbox row for the event,
+        # written in the same transaction as the stock/dedup writes
+        res_outbox = await session.execute(select(OutboxMessage))
+        outbox_rows = res_outbox.scalars().all()
+        assert len(outbox_rows) == 1, f"Expected 1 outbox message, found {len(outbox_rows)}"
+        assert outbox_rows[0].processed == "PENDING"
+        assert outbox_rows[0].event_type == "InventoryReserved"
 
     print("\n✅ Atomic Idempotency Test Passed: Exactly-once business effect guaranteed!")
 

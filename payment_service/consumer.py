@@ -1,11 +1,11 @@
 import asyncio
 import json
 import os
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from payment_service.database import engine, Base, AsyncSessionLocal
-from payment_service.models import Payment, ProcessedPaymentEvent
+from payment_service.models import Payment, ProcessedPaymentEvent, OutboxMessage
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', '127.0.0.1:9092')
 INVENTORY_TOPIC = "inventory-events"
@@ -18,7 +18,7 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-async def process_payment_event(event_data: dict, producer: AIOKafkaProducer):
+async def process_payment_event(event_data: dict):
     event_type = event_data.get("event_type")
     
     # Sirf InventoryReserved events ko process karna hai
@@ -62,13 +62,20 @@ async def process_payment_event(event_data: dict, producer: AIOKafkaProducer):
                 new_payment = Payment(order_id=order_id, amount=amount, status=payment_status)
                 session.add(new_payment)
 
-            # 3. Publish event only after successful DB commit
+                # TRANSACTIONAL OUTBOX: persist the event in the SAME atomic DB
+                # transaction as the payment write (no dual-write to Kafka here).
+                # The relay worker publishes it to Kafka after this commit.
+                session.add(OutboxMessage(
+                    event_type=out_event['event_type'],
+                    payload=json.dumps(out_event),
+                    processed='PENDING'
+                ))
+
+            # 3. Log outcome only after successful DB commit
             if payment_status == "SUCCESS":
                 print(f"💳 Payment SUCCESS of ₹{amount} for Order #{order_id}!")
             else:
                 print(f"❌ Payment FAILED of ₹{amount} for Order #{order_id} (Limit exceeded)!")
-
-            await producer.send_and_wait(PAYMENT_TOPIC, json.dumps(out_event).encode('utf-8'))
 
         except IntegrityError:
             # Duplicate event caught atomically by Primary Key constraint
@@ -85,17 +92,15 @@ async def run_payment_consumer():
         auto_offset_reset="earliest",
         enable_auto_commit=False
     )
-    producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
 
     await consumer.start()
-    await producer.start()
     print("💳 Payment Consumer is listening for inventory events on Redpanda/Kafka...")
 
     try:
         async for msg in consumer:
             event_payload = json.loads(msg.value.decode('utf-8'))
             print(f"📥 [Payment] Received event: {event_payload}")
-            await process_payment_event(event_payload, producer)
+            await process_payment_event(event_payload)
 
             # MANUAL COMMIT: acknowledge the offset only after processing succeeded
             await consumer.commit()
@@ -103,7 +108,6 @@ async def run_payment_consumer():
         print(f"❌ Error in payment consumer: {e}")
     finally:
         await consumer.stop()
-        await producer.stop()
 
 if __name__ == "__main__":
     asyncio.run(run_payment_consumer())

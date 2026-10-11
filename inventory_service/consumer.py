@@ -1,11 +1,11 @@
 import asyncio
 import json
 import os
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from inventory_service.database import engine, Base, AsyncSessionLocal
-from inventory_service.models import InventoryItem, ProcessedEvent
+from inventory_service.models import InventoryItem, ProcessedEvent, OutboxMessage
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', '127.0.0.1:9092')
 ORDER_TOPIC = "order-events"
@@ -36,7 +36,7 @@ async def init_db_and_seed_data():
             await session.commit()
             print(f"📦 Initial stock seeded: {SEED_ITEM_NAME} (Stock: {SEED_ITEM_STOCK})")
 
-async def process_order_event(event_data: dict, producer: AIOKafkaProducer):
+async def process_order_event(event_data: dict):
     order_id = event_data.get("order_id")
     item_name = event_data.get("item_name")
     quantity = event_data.get("quantity", 1)
@@ -89,9 +89,14 @@ async def process_order_event(event_data: dict, producer: AIOKafkaProducer):
                     "reason": "OUT_OF_STOCK"
                 }
 
-        # DUAL-WRITE DECOUPLING: DB transaction commits first (block exit above),
-        # only then publish the resulting event to Kafka.
-        await producer.send_and_wait(INVENTORY_TOPIC, json.dumps(out_event).encode('utf-8'))
+            # TRANSACTIONAL OUTBOX: persist the event in the SAME atomic DB
+            # transaction as the stock/dedup writes (no dual-write to Kafka here).
+            # The relay worker publishes it to Kafka after this commit.
+            session.add(OutboxMessage(
+                event_type=out_event['event_type'],
+                payload=json.dumps(out_event),
+                processed='PENDING'
+            ))
 
 async def process_compensation_event(event_data: dict):
     event_type = event_data.get("event_type")
@@ -137,17 +142,15 @@ async def run_inventory_consumer():
         auto_offset_reset="earliest",
         enable_auto_commit=False
     )
-    producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
 
     await consumer.start()
-    await producer.start()
     print("🎧 Inventory Consumer is listening on [order-events, payment-events]...")
 
     try:
         async for msg in consumer:
             event_payload = json.loads(msg.value.decode('utf-8'))
             if msg.topic == ORDER_TOPIC:
-                await process_order_event(event_payload, producer)
+                await process_order_event(event_payload)
             elif msg.topic == PAYMENT_TOPIC:
                 await process_compensation_event(event_payload)
 
@@ -157,7 +160,6 @@ async def run_inventory_consumer():
         print(f"❌ Error in inventory consumer: {e}")
     finally:
         await consumer.stop()
-        await producer.stop()
 
 if __name__ == "__main__":
     asyncio.run(run_inventory_consumer())

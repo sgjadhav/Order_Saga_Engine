@@ -19,16 +19,27 @@ async def run_relay_worker():
         while True:
             # 2. Database Session create karke un-processed events dhoondo
             async with AsyncSessionLocal() as session:
-                query = select(OutboxMessage).where(OutboxMessage.processed == "PENDING").limit(10)
+                query = (
+                    select(OutboxMessage)
+                    .where(OutboxMessage.processed == "PENDING")
+                    .with_for_update(skip_locked=True)
+                    .limit(10)
+                )
                 result = await session.execute(query)
                 pending_messages = result.scalars().all()
 
                 for msg in pending_messages:
                     print(f"📦 Relaying Event ID: {msg.id} | Type: {msg.event_type}")
 
-                    # 3. Message ko Kafka topic par push karo
+                    # 3. Message ko Kafka topic par push karo (partitioned by order_id
+                    # so all events for one order keep their relative order)
                     message_bytes = msg.payload.encode('utf-8')
-                    await producer.send_and_wait(KAFKA_TOPIC, message_bytes)
+                    payload_dict = json.loads(msg.payload)
+                    await producer.send_and_wait(
+                        KAFKA_TOPIC,
+                        message_bytes,
+                        key=str(payload_dict.get('order_id')).encode('utf-8')
+                    )
 
                     # 4. Outbox table mein status update karo
                     msg.processed = "PROCESSED"
