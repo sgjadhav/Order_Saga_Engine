@@ -1,16 +1,16 @@
 # Distributed Event-Driven Order Processing System
 
-> *Just learned and built something about how things work in backend systems. Yup, in tech, the sky is the limit — but that's what we try, and this is what I learned and built. If you clicked something I didn't, please do suggest, I do give credits😊*
+> *An asynchronous, production-hardened distributed backend demonstrating event-driven choreography, strict distributed consistency primitives, and concurrency control.*
 
-An asynchronous, resilient distributed transaction backend built with **FastAPI, PostgreSQL, and Redpanda** (Kafka-compatible event streaming broker).
+An enterprise-grade, event-driven microservices architecture built with **FastAPI, PostgreSQL, and Redpanda** (Kafka protocol).
 
-The platform implements core distributed consistency primitives — specifically the **Transactional Outbox Pattern** to prevent dual-write data corruption and a **Choreographed Saga with Compensating Transactions** to achieve eventual consistency across decoupled services.
+The system addresses fundamental distributed systems challenges: eliminating the **Dual-Write Vulnerability** across all participating services via the **Transactional Outbox Pattern**, mitigating race conditions through **Pessimistic Row-Level Locking**, ensuring message ordering with **Partition Keys**, and guaranteeing eventual consistency using a **Choreographed Saga with Compensating Rollbacks**.
 
 ---
 
 ## Architectural Blueprint
 
-The system is built using **FastAPI + Uvicorn + AsyncIO** for asynchronous REST-based service execution, **PostgreSQL + SQLAlchemy Async + asyncpg** for service-specific persistence, and **Redpanda + aiokafka** for asynchronous event streaming. The entire distributed environment is containerized using **Docker and Docker Compose**.
+The platform utilizes three fully isolated microservices with dedicated databases per service, orchestrated asynchronously via Redpanda log streaming.
 
 ```text
                            [ Client / API Gateway ]
@@ -18,295 +18,148 @@ The system is built using **FastAPI + Uvicorn + AsyncIO** for asynchronous REST-
                                       │ POST /orders
                                       ▼
                         ┌───────────────────────────┐
-                        │       Order Service       │
-                        │      (Port: 8000)         │
-                        │                           │
-                        │ FastAPI + Uvicorn         │
-                        │ AsyncIO                   │
+                        │       Order Service       │ (Port: 8000)
                         └─────────────┬─────────────┘
-                                      │
-                         ACID Transaction Boundary
-                              [PostgreSQL]
-                    ┌─────────────┴─────────────┐
-                    │                           │
-                    ▼                           ▼
-             Order Record                 Outbox Event
-              [PENDING]                    [PENDING]
-                    │                           │
-                    └─────────────┬─────────────┘
-                                  │
-                                  │ SQLAlchemy Async
-                                  │ + asyncpg
-                                  ▼
+                                      │ ACID Transaction (Single DB Commit)
+                        ┌─────────────┴─────────────┐
+                        ▼                           ▼
+                   Order Record               Outbox Message
+                    [PENDING]                    [PENDING]
+                        └─────────────┬─────────────┘
+                                      ▼ (SELECT ... FOR UPDATE SKIP LOCKED)
                         ┌───────────────────────────┐
-                        │    Outbox Relay Worker    │
-                        │   Continuous Poller       │
-                        │                           │
-                        │ Python + AsyncIO          │
+                        │   Order Relay Worker      │
                         └─────────────┬─────────────┘
-                                      │
-                                      │ aiokafka
-                                      │ Emits 'OrderCreated'
+                                      │ key=order_id (aiokafka)
                                       ▼
-=========================== [ REDPANDA ] ===========================
-                         Kafka-Compatible Broker
-      Topic: order-events │ inventory-events │ payment-events
-====================================================================
-            │                                                 ▲
-            │ Consumes 'OrderCreated'                         │
-            ▼                                                 │
-┌───────────────────────────────┐                             │
-│       Inventory Service       │                             │
-│                               │                             │
-│ FastAPI + AsyncIO             │                             │
-│ PostgreSQL                    │                             │
-│ SQLAlchemy Async + asyncpg    │                             │
-│                               │                             │
-│ Idempotent Deduplication      │                             │
-│ Stock Decremented (-N)        │                             │
-│ Emits 'InventoryReserved'     ┼─────────────────────────────┘
-└───────────────┬───────────────┘
-                │
-                │ aiokafka
-                │ Emits 'InventoryReserved'
-                ▼
-┌───────────────────────────────┐
-│        Payment Service        │
-│                               │
-│ FastAPI + AsyncIO             │
-│ PostgreSQL                    │
-│ SQLAlchemy Async + asyncpg    │
-│                               │
-│ Validates Limits / Funds      │
-└───────────────┬───────────────┘
-                │
-                ├───► Evaluation: SUCCESS
-                │
-                │     Emits 'PaymentCompleted'
-                │             │
-                │             ▼
-                │     Order Service
-                │     marks Order
-                │     [CONFIRMED]
-                │
-                └───► Evaluation: FAILED
-                      (Amount > Threshold)
-                              │
-                              ▼
-                       Emits 'PaymentFailed'
-                              │
-                    ┌─────────┴──────────┐
-                    │                    │
-                    ▼                    ▼
-            Inventory Service       Order Service
-            Restores Stock (+N)    marks Order
-                                   [CANCELLED]
-
-
-       ┌────────────────────────────────────────────────────┐
-       │              Infrastructure Layer                  │
-       │                                                    │
-       │ Docker + Docker Compose                            │
-       │                                                    │
-       │ Containerizes:                                     │
-       │ • Order Service                                    │
-       │ • Inventory Service                                │
-       │ • Payment Service                                  │
-       │ • PostgreSQL databases                             │
-       │ • Redpanda broker                                  │
-       │ • Outbox Relay Workers                             │
-       └────────────────────────────────────────────────────┘
+=========================== [ REDPANDA (KAFKA) ] ===========================
+    Topics: order-events (keyed) | inventory-events (keyed) | payment-events (keyed)
+============================================================================
+              │                                      ▲
+              │ Consumes 'OrderCreated'              │ key=order_id
+              ▼                                      │
+┌───────────────────────────┐          ┌───────────────────────────┐
+│     Inventory Service     │          │  Inventory Relay Worker   │
+│ • SELECT ... FOR UPDATE   │          │ (SKIP LOCKED batch poller)│
+│ • Atomic ProcessedEvent   │          └─────────────▲─────────────┘
+│ • Atomic Outbox Message   │────────────────────────┘
+└─────────────┬─────────────┘  ACID Commit (Stock + Dedup + Outbox)
+              │
+              │ Consumes 'InventoryReserved'
+              ▼
+┌───────────────────────────┐          ┌───────────────────────────┐
+│      Payment Service      │          │   Payment Relay Worker    │
+│ • Dynamic Amount Eval     │          │ (SKIP LOCKED batch poller)│
+│ • Atomic ProcessedEvent   │          └─────────────▲─────────────┘
+│ • Atomic Outbox Message   │────────────────────────┘
+└─────────────┬─────────────┘  ACID Commit (Payment + Dedup + Outbox)
+              │
+              ├──► [SUCCESS] ──► Emits 'PaymentCompleted' ──► Order CONFIRMED
+              │
+              └──► [FAILURE] ──► Emits 'PaymentFailed'
+                                        │
+                                        ├──► Inventory Restores Stock (+N)
+                                        └──► Order CANCELLED
 ```
-
-### Architecture Components
-
-* **FastAPI + Uvicorn** — Provides the REST API layer and runs each service as an ASGI application.
-* **AsyncIO** — Enables asynchronous request handling, database operations, and event consumption.
-* **PostgreSQL 16** — Provides persistent, service-specific storage.
-* **SQLAlchemy 2.0 Async + asyncpg** — Handles asynchronous ORM/database interaction.
-* **Redpanda** — Acts as the Kafka-compatible distributed event streaming broker.
-* **aiokafka** — Provides asynchronous Kafka-compatible event production and consumption.
-* **Docker + Docker Compose** — Containerizes and orchestrates the distributed services and infrastructure.
-
-### Distributed Consistency Flow
-
-1. **Order Creation**
-   The client sends `POST /orders` to the Order Service.
-
-2. **Transactional Outbox**
-   Within the same PostgreSQL ACID transaction:
-
-   * The order is created with `PENDING` status.
-   * An `OrderCreated` event is written to the Outbox table.
-
-   This prevents the **dual-write problem**, where the database update succeeds but publishing the corresponding event fails.
-
-3. **Outbox Relay**
-   A continuously running worker polls pending Outbox events and publishes them to **Redpanda** using `aiokafka`.
-
-4. **Inventory Reservation**
-   Inventory Service consumes `OrderCreated`, validates stock, performs an idempotent stock decrement, and publishes `InventoryReserved`.
-
-5. **Payment Processing**
-   Payment Service consumes `InventoryReserved` and evaluates whether the payment can be completed.
-
-6. **Successful Saga Path**
-
-   ```text
-   OrderCreated
-       ↓
-   InventoryReserved
-       ↓
-   PaymentCompleted
-       ↓
-   Order → CONFIRMED
-   ```
-
-7. **Failure & Compensation**
-
-   ```text
-   OrderCreated
-       ↓
-   InventoryReserved
-       ↓
-   PaymentFailed
-       ↓
-   ┌─────────────────────┐
-   │ Compensation        │
-   ├─────────────────────┤
-   │ Restore Stock (+N)  │
-   │ Order → CANCELLED   │
-   └─────────────────────┘
-   ```
-
-   Instead of relying on a distributed database transaction, the system uses a **Choreographed Saga**, where services react to events and execute compensating transactions when a later step fails.
 
 ---
 
-## Core Distributed-System Concepts Demonstrated
+## Distributed Consistency & Resilience Invariants
 
-### 1. Transactional Outbox Pattern
+### 1. Ubiquitous Transactional Outbox (Zero Dual-Write Window)
+In a naive distributed setup, writing to a database and then emitting an event over the network creates a crash window where data persists but events are permanently lost.
+* **Implementation:** `order_service`, `inventory_service`, and `payment_service` all write their state changes, deduplication records, and outgoing events into their local `outbox` table within the **exact same ACID database transaction** (`async with session.begin():`).
+* **Guarantee:** If a service or container crashes, un-emitted events remain safely committed on disk and are dispatched upon worker restart.
 
-The Order Service stores the business state change and the corresponding event in the **same PostgreSQL transaction**.
+### 2. Multi-Instance Safe Scaling (`SELECT ... FOR UPDATE SKIP LOCKED`)
+Outbox relay workers can safely scale out across multiple container replicas without race conditions or duplicate publish storms:
+```sql
+SELECT * FROM outbox 
+WHERE processed = 'PENDING' 
+ORDER BY id 
+FOR UPDATE SKIP LOCKED 
+LIMIT 10;
+```
+Each worker locks its batch exclusively while allowing concurrent workers to immediately grab subsequent pending records.
 
+### 3. Strict Per-Order Partition Key Ordering
+Distributed event logs with multiple partitions can deliver events out-of-order if published without a partition key.
+* **Implementation:** Every relay worker explicitly publishes messages using the order identifier as the Kafka partition key:
+```python
+key = str(payload["order_id"]).encode("utf-8")
+await producer.send_and_wait(TOPIC, message_bytes, key=key)
+```
+* **Guarantee:** All lifecycle events for a specific order (`OrderCreated`, `InventoryReserved`, `PaymentFailed`) land on the exact same topic partition, ensuring deterministic consumer ordering.
+
+### 4. Pessimistic Row-Level Locking (`with_for_update()`)
+Under burst concurrency (e.g., flash sales), simultaneous requests could lead to race conditions, inventory overselling, and negative stock balances.
+* **Implementation:** Inventory reservations execute row-level locks via SQLAlchemy's `.with_for_update()` before verifying and decrementing stock.
+* **Guarantee:** Concurrent events queue deterministically at the database row level, preventing race conditions.
+
+### 5. Atomic Consumer Idempotency & Deduplication
+Because Kafka provides **at-least-once delivery guarantees**, network retries or consumer restarts can produce duplicate deliveries.
+* **Implementation:** Incoming events are tracked in a dedicated `processed_events` table using unique primary key constraints on `event_id`. Duplicate deliveries trigger a DB-level `IntegrityError` which gracefully rolls back the session without duplicate execution.
+
+### 6. Zero Message Loss (Manual Offset Commit)
+Default broker auto-commits (`enable_auto_commit=True`) acknowledge messages before processing completes.
+* **Implementation:** Auto-commit is disabled across all consumers. Manual offset acknowledgement (`await consumer.commit()`) is invoked strictly after local DB transactions succeed.
+
+---
+
+## End-to-End Choreographed Saga Flow
+
+1. **Happy Path:**
 ```text
-BEGIN TRANSACTION
-
-    INSERT Order
-    INSERT Outbox Event
-
-COMMIT
+OrderCreated [PENDING] 
+    ──► InventoryReserved [Stock Decremented] 
+    ──► PaymentCompleted [Payment Recorded] 
+    ──► Order CONFIRMED
 ```
 
-The event is then published asynchronously by the Outbox Relay.
-
-This provides reliable event publication without requiring a distributed transaction between PostgreSQL and Redpanda.
-
-### 2. Choreographed Saga
-
-There is no central transaction coordinator.
-
-Instead, services communicate through events:
-
+2. **Compensating Rollback Path (e.g., Payment Limit Exceeded):**
 ```text
-Order Service
-      │
-      │ OrderCreated
-      ▼
-Inventory Service
-      │
-      │ InventoryReserved
-      ▼
-Payment Service
-      │
-      ├── PaymentCompleted ──► Order CONFIRMED
-      │
-      └── PaymentFailed
-                │
-                ├──► Inventory restores stock
-                └──► Order CANCELLED
+OrderCreated [PENDING] 
+    ──► InventoryReserved [Stock Decremented] 
+    ──► PaymentFailed [Threshold Exceeded] 
+    ──► [Compensation Triggered] 
+          ├── Inventory Service releases lock and restores stock (+N)
+          └── Order Service updates status to CANCELLED
 ```
-
-### 3. Compensating Transactions
-
-When a later operation fails, previously completed operations are logically reversed.
-
-For example:
-
-```text
-Reserve Stock
-      ↓
-Payment FAILS
-      ↓
-Restore Stock
-```
-
-This provides **eventual consistency** rather than traditional ACID consistency across multiple services.
-
-### 4. Idempotency
-
-Consumers are designed to safely handle duplicate events.
-
-If the same event is delivered more than once, the service checks whether it has already been processed before applying the business operation again.
-
-```text
-Event ID
-   ↓
-Already Processed?
-   ├── YES → Ignore
-   └── NO  → Process + Record Event ID
-```
-
-This is important because event-driven systems generally provide **at-least-once delivery semantics**, meaning consumers must be prepared for duplicate messages.
 
 ---
 
 ## Technology Stack
 
-The technologies are intentionally shown as part of the architecture because they map directly to specific responsibilities:
-
-| Layer          | Technology               | Responsibility                     |
-| -------------- | ------------------------ | ---------------------------------- |
-| API            | **FastAPI**              | REST API layer                     |
-| ASGI Server    | **Uvicorn**              | Runs FastAPI services              |
-| Concurrency    | **AsyncIO**              | Asynchronous execution             |
-| Database       | **PostgreSQL 16**        | Persistent service data            |
-| ORM            | **SQLAlchemy 2.0 Async** | Database interaction               |
-| DB Driver      | **asyncpg**              | Async PostgreSQL connectivity      |
-| Event Broker   | **Redpanda**             | Event streaming                    |
-| Kafka Client   | **aiokafka**             | Async event production/consumption |
-| Infrastructure | **Docker**               | Containerization                   |
-| Orchestration  | **Docker Compose**       | Local distributed environment      |
+| Layer | Technology | Responsibility |
+| :--- | :--- | :--- |
+| **API Framework** | **FastAPI + Uvicorn** | High-performance asynchronous REST endpoints |
+| **Concurrency** | **AsyncIO** | Non-blocking I/O across DB operations and event consumption |
+| **Persistence** | **PostgreSQL 16 (Dedicated DBs)** | Isolated databases per microservice |
+| **Async ORM & Driver** | **SQLAlchemy 2.0 Async + asyncpg** | Asynchronous session management and row locking |
+| **Streaming Broker** | **Redpanda** | Ultra-low latency, Kafka-compatible distributed event log |
+| **Kafka Client** | **aiokafka** | Asynchronous message production, manual offset management |
+| **Containerization** | **Docker & Docker Compose** | Full infrastructure orchestration |
 
 ---
 
-## Dependencies
+## Local Deployment & Verification
 
-Install the required Python dependencies:
+### 1. Prerequisites
+* Docker & Docker Compose
+* Python 3.12+
 
-```powershell
-pip install fastapi uvicorn sqlalchemy asyncpg aiokafka psycopg2-binary
+### 2. Start Infrastructure
+Start the isolated PostgreSQL databases and Redpanda streaming broker:
+```bash
+docker compose up -d
 ```
 
----
+### 3. Run Verification Tests
+Verify row-level locking concurrency and atomic deduplication under simulated high-contention loads:
+```bash
+# Concurrency & overselling protection
+pytest tests/test_inventory_concurrency.py
 
-## What This Project Demonstrates
-
-This project is primarily a practical implementation of **distributed backend concepts**, rather than simply a CRUD application.
-
-It demonstrates:
-
-* Asynchronous microservices
-* Event-driven architecture
-* Transactional Outbox Pattern
-* Dual-write problem mitigation
-* Choreographed Saga
-* Compensating transactions
-* Eventual consistency
-* Idempotent event processing
-* Kafka-compatible event streaming
-* Service-specific databases
-* ACID transaction boundaries
-* Asynchronous database operations
-* Containerized distributed infrastructure
-* Failure handling across distributed services
+# Consumer duplicate delivery idempotency
+pytest tests/test_consumer_idempotency.py
+```
