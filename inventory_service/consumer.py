@@ -4,6 +4,7 @@ import os
 from aiokafka import AIOKafkaConsumer
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from prometheus_client import start_http_server, Counter
 from inventory_service.database import engine, Base, AsyncSessionLocal
 from inventory_service.models import InventoryItem, ProcessedEvent, OutboxMessage
 
@@ -16,6 +17,20 @@ PAYMENT_TOPIC = "payment-events"
 SEED_ITEM_NAME = os.getenv('SEED_ITEM_NAME', 'Mechanical Keyboard')
 SEED_ITEM_STOCK = int(os.getenv('SEED_ITEM_STOCK', '10'))
 SEED_ITEM_PRICE = float(os.getenv('SEED_ITEM_PRICE', '4500.0'))
+
+# Custom Prometheus metrics for the inventory saga steps (served on :8001)
+INVENTORY_RESERVED_TOTAL = Counter(
+    'inventory_reserved_total',
+    'Number of times stock was decremented successfully for an order'
+)
+INVENTORY_FAILED_TOTAL = Counter(
+    'inventory_failed_total',
+    'Number of times a reservation failed due to insufficient stock'
+)
+INVENTORY_REFUNDED_TOTAL = Counter(
+    'inventory_refunded_total',
+    'Number of times saga compensation restored stock'
+)
 
 async def init_db_and_seed_data():
     async with engine.begin() as conn:
@@ -69,6 +84,7 @@ async def process_order_event(event_data: dict):
 
             if item and item.available_stock >= quantity:
                 item.available_stock -= quantity
+                INVENTORY_RESERVED_TOTAL.inc()
                 # Both ProcessedEvent and Inventory update commit atomically at block exit
                 print(f"✅ Stock Reserved for Order #{order_id}! Remaining Stock: {item.available_stock}")
 
@@ -83,6 +99,7 @@ async def process_order_event(event_data: dict):
                 }
             else:
                 print(f"❌ Insufficient Stock for Order #{order_id} ({item_name})!")
+                INVENTORY_FAILED_TOTAL.inc()
                 out_event = {
                     "event_type": "InventoryFailed",
                     "order_id": order_id,
@@ -129,10 +146,15 @@ async def process_compensation_event(event_data: dict):
 
             if item:
                 item.available_stock += quantity
+                INVENTORY_REFUNDED_TOTAL.inc()
                 print(f"🔄 [Saga Compensation] Restored {quantity} units of '{item_name}' for Order #{order_id}. Current Stock: {item.available_stock}")
 
 async def run_inventory_consumer():
     await init_db_and_seed_data()
+
+    # Metrics server runs in its own daemon thread -> non-blocking for the asyncio loop
+    start_http_server(8001, addr='0.0.0.0')
+    print("📊 Inventory metrics server listening on http://0.0.0.0:8001/metrics")
 
     consumer = AIOKafkaConsumer(
         ORDER_TOPIC,

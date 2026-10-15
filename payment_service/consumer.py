@@ -4,6 +4,7 @@ import os
 from aiokafka import AIOKafkaConsumer
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from prometheus_client import start_http_server, Counter
 from payment_service.database import engine, Base, AsyncSessionLocal
 from payment_service.models import Payment, ProcessedPaymentEvent, OutboxMessage
 
@@ -13,6 +14,16 @@ PAYMENT_TOPIC = "payment-events"
 
 # Payment evaluation threshold configurable via environment (12-factor)
 PAYMENT_LIMIT_THRESHOLD = float(os.getenv('PAYMENT_LIMIT_THRESHOLD', '10000.0'))
+
+# Custom Prometheus metrics for the payment saga step (served on :8002)
+PAYMENTS_SUCCESSFUL_TOTAL = Counter(
+    'payments_successful_total',
+    'Number of payments completed successfully'
+)
+PAYMENTS_FAILED_TOTAL = Counter(
+    'payments_failed_total',
+    'Number of payments failed because the amount exceeded the threshold'
+)
 
 async def init_db():
     async with engine.begin() as conn:
@@ -73,8 +84,10 @@ async def process_payment_event(event_data: dict):
 
             # 3. Log outcome only after successful DB commit
             if payment_status == "SUCCESS":
+                PAYMENTS_SUCCESSFUL_TOTAL.inc()
                 print(f"💳 Payment SUCCESS of ₹{amount} for Order #{order_id}!")
             else:
+                PAYMENTS_FAILED_TOTAL.inc()
                 print(f"❌ Payment FAILED of ₹{amount} for Order #{order_id} (Limit exceeded)!")
 
         except IntegrityError:
@@ -84,6 +97,10 @@ async def process_payment_event(event_data: dict):
 
 async def run_payment_consumer():
     await init_db()
+
+    # Metrics server runs in its own daemon thread -> non-blocking for the asyncio loop
+    start_http_server(8002, addr='0.0.0.0')
+    print("📊 Payment metrics server listening on http://0.0.0.0:8002/metrics")
 
     consumer = AIOKafkaConsumer(
         INVENTORY_TOPIC,

@@ -2,6 +2,7 @@ import json
 from contextlib import asynccontextmanager
 from typing import List
 from fastapi import FastAPI, Depends, HTTPException, status
+from prometheus_fastapi_instrumentator import Instrumentator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -24,6 +25,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# Expose HTTP metrics at /metrics without altering existing routes or lifespan
+Instrumentator().instrument(app).expose(app)
 
 @app.get("/")
 async def root():

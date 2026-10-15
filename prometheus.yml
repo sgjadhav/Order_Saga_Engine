@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 2s
+
+scrape_configs:
+  - job_name: 'redpanda'
+    static_configs:
+      - targets: ['redpanda:9644']
+
+  - job_name: 'order_service'
+    static_configs:
+      - targets: ['host.docker.internal:8000']
+
+  - job_name: 'inventory_service'
+    static_configs:
+      - targets: ['host.docker.internal:8001']
+
+  - job_name: 'payment_service'
+    static_configs:
+      - targets: ['host.docker.internal:8002']
